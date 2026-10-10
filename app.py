@@ -4,8 +4,6 @@ Kwoty przyjmowane są w złotych (np. "12.50"), a przechowywane jako liczba
 całkowita groszy, żeby uniknąć błędów zaokrągleń.
 """
 import os
-import hashlib
-import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -14,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 try:
-    import httpx
-    from fastapi import FastAPI, Header, HTTPException
+    import httpx  # noqa: F401  (used by wwg_sdk to reach the gateway)
+    from fastapi import FastAPI, Header, HTTPException, Request
     from fastapi.responses import FileResponse
     from pydantic import BaseModel, Field, field_validator
 except ImportError:
@@ -27,6 +25,10 @@ except ImportError:
 DB_PATH = os.environ.get("BANK_DB", "bank.db")
 BANK_GATEWAY_URL = os.environ.get("BANK_GATEWAY_URL", "").rstrip("/")
 BANK_SERVICE_ID = os.environ.get("BANK_SERVICE_ID", "mini-bank")
+BANK_GATEWAY_ISSUER = os.environ.get("BANK_GATEWAY_ISSUER", "wwgateway-dev")
+BANK_PROTECT_READS = os.environ.get("BANK_PROTECT_READS", "1") == "1"
+
+from wwg_sdk import GatewayVerifier, SQLiteReplayStore, VerificationError, apply_data_scope  # noqa: E402
 
 app = FastAPI(title="Mini Bank")
 
@@ -98,38 +100,56 @@ def to_pln(grosze: int) -> str:
     return f"{Decimal(grosze) / 100:.2f}"
 
 
-def _authorization_token(authorization: str | None) -> str:
-    prefix = "GatewayAction "
+_verifier: GatewayVerifier | None = None
+
+
+def gateway_verifier() -> GatewayVerifier:
+    """Local token verification (EdDSA via JWKS, proof of possession, single use, live policy)."""
+    global _verifier
+    if _verifier is None or _verifier.gateway_url != BANK_GATEWAY_URL:
+        _verifier = GatewayVerifier(
+            gateway_url=BANK_GATEWAY_URL,
+            issuer=BANK_GATEWAY_ISSUER,
+            audience=BANK_SERVICE_ID,
+            replay_store=SQLiteReplayStore(DB_PATH),
+        )
+    return _verifier
+
+
+def _token(authorization: str | None, scheme: str) -> str:
+    prefix = scheme + " "
     if not authorization or not authorization.startswith(prefix):
-        raise HTTPException(401, "GatewayAction token required")
+        raise HTTPException(401, {"error": "token_required", "message": f"{scheme} token required"})
     return authorization[len(prefix):]
 
 
-def _params_hash(params: dict[str, Any]) -> str:
-    payload = json.dumps(params, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def require_gateway_action(expected_action: str, params: dict[str, Any], authorization: str | None) -> None:
-    """Validate a gateway action token when BANK_GATEWAY_URL is configured.
-
-    Local development keeps working without a gateway. Integration mode is enabled by setting
-    BANK_GATEWAY_URL, then every protected write must carry Authorization: GatewayAction <token>.
+def require_gateway_action(request: Request, expected_action: str, params: dict[str, Any], authorization: str | None, proof: str | None) -> dict[str, Any] | None:
+    """Gateway mode (BANK_GATEWAY_URL set): every protected write needs
+    Authorization: GatewayAction <token> and WWG-Proof: <proof signed by the agent key>.
+    Without BANK_GATEWAY_URL the bank runs standalone for local development.
     """
     if not BANK_GATEWAY_URL:
-        return
-    token = _authorization_token(authorization)
+        return None
+    token = _token(authorization, "GatewayAction")
     try:
-        response = httpx.post(f"{BANK_GATEWAY_URL}/v1/validate/action", json={"token": token}, timeout=3)
-    except httpx.HTTPError as exc:
-        raise HTTPException(503, f"Gateway unavailable: {exc}") from exc
-    if response.status_code != 200:
-        raise HTTPException(401, "Gateway token rejected")
-    claims = response.json().get("claims", {})
-    if claims.get("service") != BANK_SERVICE_ID or claims.get("action") != expected_action:
-        raise HTTPException(403, "Gateway token does not authorize this bank action")
-    if claims.get("params_hash") != _params_hash(params):
-        raise HTTPException(403, "Gateway token parameters do not match this request")
+        return gateway_verifier().verify_action(token, proof, method=request.method, url=str(request.url), action=expected_action, params=params)
+    except VerificationError as exc:
+        raise HTTPException(exc.status, {"error": exc.code, "message": exc.message}) from exc
+
+
+def require_gateway_data(request: Request, table: str, authorization: str | None, proof: str | None) -> dict[str, Any] | None:
+    """Reads need Authorization: GatewayData <data_access_token> in gateway mode (BANK_PROTECT_READS=1)."""
+    if not BANK_GATEWAY_URL or not BANK_PROTECT_READS:
+        return None
+    token = _token(authorization, "GatewayData")
+    try:
+        return gateway_verifier().verify_data_access(token, proof, method=request.method, url=str(request.url), table=table)
+    except VerificationError as exc:
+        raise HTTPException(exc.status, {"error": exc.code, "message": exc.message}) from exc
+
+
+def scoped(rows: list[dict[str, Any]], claims: dict[str, Any] | None, table: str) -> list[dict[str, Any]]:
+    return rows if claims is None else apply_data_scope(rows, claims, table)
 
 
 def account_out(row: sqlite3.Row) -> dict:
@@ -215,46 +235,51 @@ def index():
 
 
 @app.post("/accounts", status_code=201)
-def create_account(body: NewAccount, authorization: str | None = Header(default=None)):
-    require_gateway_action("account.create", {"owner": body.owner, "initial_balance": str(body.initial_balance)}, authorization)
+def create_account(request: Request, body: NewAccount, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
+    require_gateway_action(request, "account.create", {"owner": body.owner, "initial_balance": str(body.initial_balance)}, authorization, wwg_proof)
     return create_account_record(body.owner, body.initial_balance)
 
 
 @app.post("/users", status_code=201)
-def create_user(body: NewUser, authorization: str | None = Header(default=None)):
-    require_gateway_action("user.create", {"email": body.email, "name": body.name, "initial_balance": str(body.initial_balance)}, authorization)
+def create_user(request: Request, body: NewUser, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
+    require_gateway_action(request, "user.create", {"email": body.email, "name": body.name, "initial_balance": str(body.initial_balance)}, authorization, wwg_proof)
     account = create_account_record(body.name, body.initial_balance)
     return {"id": account["id"], "name": body.name, "email": body.email, "account": account}
 
 
 @app.get("/accounts")
-def list_accounts(include_closed: bool = False):
+def list_accounts(request: Request, include_closed: bool = False, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
+    claims = require_gateway_data(request, "accounts", authorization, wwg_proof)
     conn = connect()
     try:
         sql = "SELECT * FROM accounts" + ("" if include_closed else " WHERE closed_at IS NULL") + " ORDER BY id"
-        return [account_out(r) for r in conn.execute(sql)]
+        return scoped([account_out(r) for r in conn.execute(sql)], claims, "accounts")
     finally:
         conn.close()
 
 
 @app.get("/accounts/{account_id}")
-def read_account(account_id: int):
+def read_account(request: Request, account_id: int, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
+    claims = require_gateway_data(request, "accounts", authorization, wwg_proof)
     conn = connect()
     try:
-        return account_out(get_account(conn, account_id, allow_closed=True))
+        rows = scoped([account_out(get_account(conn, account_id, allow_closed=True))], claims, "accounts")
+        if not rows:
+            raise HTTPException(404, f"Konto {account_id} nie istnieje")
+        return rows[0]
     finally:
         conn.close()
 
 
 @app.delete("/accounts/{account_id}")
-def close_account(account_id: int, transfer_to: int | None = None, authorization: str | None = Header(default=None)): #token jwt
+def close_account(request: Request, account_id: int, transfer_to: int | None = None, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
     """Zamyka (usuwa) konto. Historia operacji zostaje, konto znika z listy.
 
     Jeśli na koncie są pieniądze, trzeba podać `transfer_to` — konto, na które
     zostanie przelane całe saldo. Wszystko dzieje się w jednej transakcji.
     """
     params = {"account_id": account_id, "transfer_to": transfer_to}
-    require_gateway_action("account.close", params, authorization)
+    require_gateway_action(request, "account.close", params, authorization, wwg_proof)
     with transaction() as conn:
         acc = get_account(conn, account_id)
         moved = None
@@ -280,8 +305,8 @@ def close_account(account_id: int, transfer_to: int | None = None, authorization
 
 
 @app.post("/accounts/{account_id}/deposit")
-def deposit(account_id: int, body: Amount, authorization: str | None = Header(default=None)):
-    require_gateway_action("deposit.create", {"account_id": account_id, "amount": str(body.amount)}, authorization)
+def deposit(request: Request, account_id: int, body: Amount, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
+    require_gateway_action(request, "deposit.create", {"account_id": account_id, "amount": str(body.amount)}, authorization, wwg_proof)
     amount = to_grosze(body.amount)
     with transaction() as conn:
         get_account(conn, account_id)
@@ -294,8 +319,8 @@ def deposit(account_id: int, body: Amount, authorization: str | None = Header(de
 
 
 @app.post("/transfers", status_code=201)
-def transfer(body: Transfer, authorization: str | None = Header(default=None)):
-    require_gateway_action("transfer.create", {"from_account": body.from_account, "to_account": body.to_account, "amount": str(body.amount), "title": body.title}, authorization)
+def transfer(request: Request, body: Transfer, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
+    require_gateway_action(request, "transfer.create", {"from_account": body.from_account, "to_account": body.to_account, "amount": str(body.amount), "title": body.title}, authorization, wwg_proof)
     if body.from_account == body.to_account:
         raise HTTPException(400, "Nie można przelać na to samo konto")
     amount = to_grosze(body.amount)
@@ -321,8 +346,9 @@ def transfer(body: Transfer, authorization: str | None = Header(default=None)):
 
 
 @app.get("/operations")
-def all_operations(limit: int = 50):
+def all_operations(request: Request, limit: int = 50, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
     """Wszystkie operacje w banku, od najnowszych — do podglądu „co się dzieje”."""
+    claims = require_gateway_data(request, "operations", authorization, wwg_proof)
     conn = connect()
     try:
         rows = conn.execute(
@@ -333,7 +359,7 @@ def all_operations(limit: int = 50):
                ORDER BY o.id DESC LIMIT ?""",
             (max(1, min(limit, 500)),),
         ).fetchall()
-        return [{
+        return scoped([{
             "id": r["id"],
             "kind": r["kind"],
             "from_account": r["from_account"],
@@ -343,16 +369,20 @@ def all_operations(limit: int = 50):
             "amount": to_pln(r["amount"]),
             "title": r["title"],
             "created_at": r["created_at"],
-        } for r in rows]
+        } for r in rows], claims, "operations")
     finally:
         conn.close()
 
 
 @app.get("/accounts/{account_id}/history")
-def history(account_id: int):
+def history(request: Request, account_id: int, authorization: str | None = Header(default=None), wwg_proof: str | None = Header(default=None, alias="WWG-Proof")):
+    claims = require_gateway_data(request, "operations", authorization, wwg_proof)
     conn = connect()
     try:
-        get_account(conn, account_id, allow_closed=True)
+        account = account_out(get_account(conn, account_id, allow_closed=True))
+        # the account itself must be inside the token's row scope for "accounts"
+        if claims is not None and not apply_data_scope([account], {"row_filters": claims.get("row_filters"), "columns": {}}, "accounts"):
+            raise HTTPException(404, f"Konto {account_id} nie istnieje")
         rows = conn.execute(
             "SELECT * FROM operations WHERE from_account = ? OR to_account = ? ORDER BY id DESC",
             (account_id, account_id),
@@ -369,7 +399,7 @@ def history(account_id: int):
                 "title": r["title"],
                 "created_at": r["created_at"],
             })
-        return out
+        return scoped(out, claims, "operations")
     finally:
         conn.close()
 
