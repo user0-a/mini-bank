@@ -16,41 +16,29 @@ Strona: http://127.0.0.1:8000 · Dokumentacja API: http://127.0.0.1:8000/docs
 
 ## Tryb Gateway
 
-Domyślnie bank działa samodzielnie, bez wymagania tokenów. Żeby wymusić autoryzację przez gateway dla akcji zapisu, uruchom go tak:
+Domyślnie bank działa samodzielnie. Z gatewayem:
 
 ```bash
 BANK_GATEWAY_URL=http://127.0.0.1:8001 python3 app.py --no-browser
 ```
 
-Wtedy chronione akcje wymagają nagłówka:
+Wtedy bank **sam, lokalnie** weryfikuje tokeny (`wwg_sdk.py`): podpis EdDSA gatewaya (JWKS), system
+docelowy, akcję, dokładne parametry, dowód posiadania klucza agenta, jednorazowość (tabela
+`wwg_replay` w bazie banku) oraz podpisany snapshot polityki (odwołania, poziom ryzyka). Gdy gateway
+jest niedostępny dłużej niż 30 s, bank odrzuca żądania (fail closed).
 
-```text
-Authorization: GatewayAction <action_token>
-```
+| Operacja | Nagłówki |
+|---|---|
+| Zapis (`/users`, `/accounts`, `/transfers`, wpłata, zamknięcie konta) | `Authorization: GatewayAction <token>`, `WWG-Proof: <dowód>` |
+| Odczyt (`/accounts`, `/operations`, historia) | `Authorization: GatewayData <token>`, `WWG-Proof: <dowód>` |
 
-Token jest walidowany w gatewayu, a bank sprawdza, czy dotyczy systemu `mini-bank`, właściwej akcji oraz tych samych parametrów żądania.
+Token danych ogranicza tabele, kolumny i wiersze. `BANK_PROTECT_READS=0` wyłącza ochronę odczytów
+(np. żeby przeglądać stronę banku podczas demo); zapisy pozostają chronione.
 
-## API
+Zmienne: `BANK_GATEWAY_URL`, `BANK_GATEWAY_ISSUER` (domyślnie `wwgateway-dev`), `BANK_SERVICE_ID`
+(domyślnie `mini-bank`), `BANK_PROTECT_READS` (domyślnie `1`).
 
-| Metoda | Ścieżka | Opis |
-|---|---|---|
-| POST | `/accounts` | `{"owner": "Ala", "initial_balance": "100.00"}` |
-| POST | `/users` | `{"name": "Ala", "email": "ala@example.com", "initial_balance": "100.00"}` |
-| GET | `/accounts` | lista kont |
-| GET | `/accounts/{id}` | jedno konto |
-| POST | `/accounts/{id}/deposit` | `{"amount": "12.50"}` |
-| POST | `/transfers` | `{"from_account": 1, "to_account": 2, "amount": "30", "title": "Obiad"}` |
-| GET | `/accounts/{id}/history` | historia operacji |
-| DELETE | `/accounts/{id}` | usuwa (zamyka) puste konto |
-| DELETE | `/accounts/{id}?transfer_to=2` | usuwa konto z pieniędzmi — saldo idzie na konto 2 |
-| GET | `/accounts?include_closed=true` | lista razem z usuniętymi kontami |
-
-Usunięte konto znika z listy i nie można na nie wpłacać ani przelewać (odpowiedź 410),
-ale jego historia zostaje, bo inne konta mają z nim operacje w historii.
-
-Kwoty trzymane są w groszach (bez błędów zaokrągleń). Przelew odbywa się w jednej
-transakcji z blokadą zapisu, więc saldo nigdy nie spadnie poniżej zera, nawet przy
-wielu równoczesnych przelewach.
+`wwg_sdk.py` to kopia `gateway/sdk/python/wwg_sdk.py` — aktualizować razem.
 
 ## Testy
 
